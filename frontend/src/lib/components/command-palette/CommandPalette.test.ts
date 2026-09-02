@@ -261,6 +261,36 @@ describe("CommandPalette", () => {
     unmount(component);
   });
 
+  it("searches on a single-word query shorter than three characters", async () => {
+    const component = mount(CommandPalette, {
+      target: document.body,
+    });
+    await tick();
+
+    await enterSearchQuery("go");
+
+    expect(mockSearchStore.search).toHaveBeenCalledWith("go", "");
+    expect(mockSearchStore.clear).not.toHaveBeenCalled();
+
+    unmount(component);
+  });
+
+  it("restores recent sessions when the query is only whitespace", async () => {
+    const component = mount(CommandPalette, {
+      target: document.body,
+    });
+    await tick();
+
+    await enterSearchQuery("   ");
+
+    expect(mockSearchStore.clear).toHaveBeenCalled();
+    expect(
+      document.querySelector(".palette-section-label"),
+    ).not.toBeNull();
+
+    unmount(component);
+  });
+
   it("omits relative-time segment when timestamp is empty", async () => {
     mockSearchStore.results = [
       makeSearchResult({

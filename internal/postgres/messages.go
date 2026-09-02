@@ -269,10 +269,20 @@ func (s *Store) GetResumeModelCounts(
 func (s *Store) SearchSession(
 	ctx context.Context, sessionID, query string,
 ) ([]int, error) {
-	if query == "" {
+	terms := db.SearchTermsFromQuery(query)
+	if len(terms) == 0 {
 		return nil, nil
 	}
-	like := "%" + escapeLike(query) + "%"
+	args := []any{sessionID}
+	var pred strings.Builder
+	for i, t := range terms {
+		if i > 0 {
+			pred.WriteString(" AND ")
+		}
+		idx := i + 2
+		fmt.Fprintf(&pred, "(m.content ILIKE $%d OR tc.result_content ILIKE $%d)", idx, idx)
+		args = append(args, db.SearchLikePattern(t.Value))
+	}
 	rows, err := s.pg.QueryContext(ctx, `
 		SELECT DISTINCT m.ordinal
 		FROM messages m
@@ -282,10 +292,9 @@ func (s *Store) SearchSession(
 		WHERE m.session_id = $1
 			AND m.is_system = FALSE
 			AND `+db.PostgresSystemPrefixSQL("m.content", "m.role")+`
-			AND (m.content ILIKE $2
-				OR tc.result_content ILIKE $2)
+			AND `+pred.String()+`
 		ORDER BY m.ordinal ASC`,
-		sessionID, like,
+		args...,
 	)
 	if err != nil {
 		return nil, fmt.Errorf(
@@ -322,156 +331,191 @@ func escapeLike(v string) string {
 	return db.EscapeLikePattern(v)
 }
 
-// Search performs ILIKE-based full-text search across messages,
-// grouped to one result per session via DISTINCT ON, UNION'd with a
-// session name (display_name / first_message) branch.
+// Search performs ILIKE session search across message content and session
+// metadata. Unquoted terms are AND'd in any order and may hit different
+// fields. Quoted phrases must appear together. Ranking matches SQLite.
 func (s *Store) Search(
 	ctx context.Context, f db.SearchFilter,
 ) (db.SearchPage, error) {
 	if f.Limit <= 0 || f.Limit > db.MaxSearchLimit {
 		f.Limit = db.DefaultSearchLimit
 	}
-
-	// plainTerm is the de-quoted query joined back into one string. It feeds
-	// the name-branch ILIKE (matching the typed text against the short session
-	// name) and centers the message snippet, mirroring SQLite's plainQuery.
-	// terms is the per-term decomposition: every term must appear in the
-	// message content (AND), matching SQLite FTS5's implicit AND so the same
-	// user query behaves identically across backends. An explicit exact phrase
-	// (user-supplied leading quote) collapses to a single term, preserving the
-	// exact-phrase opt-in.
-	plainTerm := db.StripFTSQuotes(f.Query)
-	terms := db.FTSTerms(f.Query)
-	if plainTerm == "" || len(terms) == 0 {
+	terms := db.SearchTermsFromQuery(f.Query)
+	if len(terms) == 0 {
 		return db.SearchPage{}, nil
 	}
-	// firstTerm anchors POSITION-based ordering and snippet centering.
-	firstTerm := terms[0]
+	plainQuery := db.JoinedQuery(terms)
+	firstTerm := terms[0].Value
+	hasPhrase := 0
+	if db.HasQuotedPhrase(terms) {
+		hasPhrase = 1
+	}
 
-	// Validate Sort before interpolating into ORDER BY.
-	// session_id ASC is a deterministic tie-breaker for both modes,
-	// preventing pagination instability when sort keys are equal.
-	// NULLS LAST ensures sessions with NULL timestamps sort after
-	// sessions with real timestamps under DESC ordering.
-	// match_priority: 1 = message content match, 2 = name-only match.
-	// This ensures content matches always rank above name-only fallbacks
-	// regardless of match_pos (name-only rows have match_pos=0 which would
-	// otherwise sort them before content matches under match_pos ASC alone).
-	// match_priority: 1 = message content match, 2 = name-only match.
-	// Only applied in relevance mode so content matches rank above name-only
-	// fallbacks. Recency mode orders purely by time so the newest session
-	// wins regardless of match type.
-	outerOrderBy := "match_priority ASC, match_pos ASC, session_ended_at DESC NULLS LAST, session_id ASC"
+	outerOrderBy := "relevance ASC, match_pos ASC, session_ended_at DESC NULLS LAST, session_id ASC"
 	if f.Sort == "recency" {
 		outerOrderBy = "session_ended_at DESC NULLS LAST, session_id ASC"
 	}
 
-	// $1 = escaped ILIKE pattern for the name branch (full plain term)
-	// $2 = raw first term (for POSITION — case folded in expression)
-	args := []any{escapeLike(plainTerm), firstTerm}
-	argIdx := 3
+	blobSQL := db.SessionSearchBlobSQL("s")
+	primarySQL := db.SessionPrimaryBlobSQL("s")
+	sysMsg := db.PostgresSystemPrefixSQL("m.content", "m.role")
+	sysVis := db.PostgresSystemPrefixSQL("mx.content", "mx.role")
 
-	// Message branch matches every term (AND). Each term gets its own escaped
-	// ILIKE placeholder so a multi-word query requires all terms to be present
-	// without demanding they be contiguous, exactly like SQLite FTS5.
-	termClauses := make([]string, len(terms))
+	var args []any
+	ph := func(v any) string {
+		args = append(args, v)
+		return fmt.Sprintf("$%d", len(args))
+	}
+
+	var b strings.Builder
+	b.WriteString("WITH ")
 	for i, t := range terms {
-		termClauses[i] = fmt.Sprintf(
-			"m.content ILIKE '%%' || $%d || '%%' ESCAPE E'\\\\'", argIdx)
-		args = append(args, escapeLike(t))
-		argIdx++
+		if i > 0 {
+			b.WriteString(",\n")
+		}
+		like := ph(db.SearchLikePattern(t.Value))
+		fmt.Fprintf(&b, `term%d AS (
+			SELECT m.session_id
+			FROM messages m
+			JOIN sessions s ON m.session_id = s.id
+			WHERE s.deleted_at IS NULL
+			  AND m.is_system = FALSE
+			  AND %s
+			  AND m.content ILIKE %s ESCAPE E'\\'
+			UNION
+			SELECT s.id FROM sessions s
+			WHERE s.deleted_at IS NULL
+			  AND %s ILIKE %s ESCAPE E'\\'
+			UNION
+			SELECT m.session_id FROM messages m
+			JOIN sessions s ON s.id = m.session_id
+			WHERE s.deleted_at IS NULL
+			  AND m.model ILIKE %s ESCAPE E'\\'
+			UNION
+			SELECT tc.session_id FROM tool_calls tc
+			JOIN sessions s ON s.id = tc.session_id
+			WHERE s.deleted_at IS NULL
+			  AND (
+			    tc.tool_name ILIKE %s ESCAPE E'\\'
+			    OR COALESCE(tc.skill_name, '') ILIKE %s ESCAPE E'\\'
+			    OR COALESCE(tc.file_path, '') ILIKE %s ESCAPE E'\\'
+			  )
+		)`, i, sysMsg, like, blobSQL, like, like, like, like, like)
 	}
-	msgTermPredicate := strings.Join(termClauses, "\n\t\t\t\t\tAND ")
 
-	msgProjectClause := ""
-	nameProjectClause := ""
+	b.WriteString(",\nmatched AS (\n")
+	for i := range terms {
+		if i > 0 {
+			b.WriteString(" INTERSECT ")
+		}
+		fmt.Fprintf(&b, "SELECT session_id FROM term%d", i)
+	}
+
+	firstLike := ph(db.SearchLikePattern(firstTerm))
+	firstRaw := ph(firstTerm)
+	plainPh := ph(plainQuery)
+	prefixPh := ph(db.SearchPrefixPattern(plainQuery))
+	hasPhrasePh := ph(hasPhrase)
+
+	primaryPredParts := make([]string, len(terms))
+	for i, t := range terms {
+		primaryPredParts[i] = primarySQL + " ILIKE " + ph(db.SearchLikePattern(t.Value)) + ` ESCAPE E'\\'`
+	}
+	primaryPred := "(" + strings.Join(primaryPredParts, " AND ") + ")"
+
+	projectClause := ""
 	if f.Project != "" {
-		msgProjectClause = fmt.Sprintf("AND s.project = $%d", argIdx)
-		nameProjectClause = fmt.Sprintf("AND s.project = $%d", argIdx)
-		args = append(args, f.Project)
-		argIdx++
+		projectClause = "AND s.project = " + ph(f.Project)
 	}
+	limitPh := ph(f.Limit + 1)
+	offsetPh := ph(f.Cursor)
 
-	query := fmt.Sprintf(`
-		WITH msg_matches AS (
+	fmt.Fprintf(&b, `
+		),
+		msg_best AS (
 			SELECT DISTINCT ON (m.session_id)
 				m.session_id,
-				s.project,
-				s.agent,
-				COALESCE(s.display_name, s.session_name, s.first_message, '') AS name,
-				COALESCE(s.ended_at, s.started_at) AS session_ended_at,
 				m.ordinal,
-				POSITION(LOWER($2) IN LOWER(m.content)) AS match_pos,
+				POSITION(LOWER(%s) IN LOWER(m.content)) AS match_pos,
 				CASE
-					WHEN POSITION(LOWER($2) IN LOWER(m.content)) > 100
+					WHEN POSITION(LOWER(%s) IN LOWER(m.content)) > 100
 						THEN '...' || SUBSTRING(m.content
 							FROM GREATEST(1, POSITION(
-								LOWER($2) IN LOWER(m.content)
+								LOWER(%s) IN LOWER(m.content)
 							) - 50) FOR 200) || '...'
 					ELSE SUBSTRING(m.content FROM 1 FOR 200)
 						|| CASE WHEN LENGTH(m.content) > 200
 							THEN '...' ELSE '' END
 				END AS snippet
 			FROM messages m
+			JOIN matched mt ON mt.session_id = m.session_id
 			JOIN sessions s ON m.session_id = s.id
-			WHERE %s
-				AND s.deleted_at IS NULL
-				AND m.is_system = FALSE
-				AND `+db.PostgresSystemPrefixSQL("m.content", "m.role")+`
-				%s
+			WHERE m.is_system = FALSE
+			  AND %s
+			  AND m.content ILIKE %s ESCAPE E'\\'
 			ORDER BY m.session_id,
-				POSITION(LOWER($2) IN LOWER(m.content)) ASC,
+				POSITION(LOWER(%s) IN LOWER(m.content)) ASC,
 				m.ordinal ASC
-		),
-		name_matches AS (
-			SELECT
-				s.id AS session_id,
-				s.project,
-				s.agent,
-				COALESCE(s.display_name, s.session_name, s.first_message, '') AS name,
-				COALESCE(s.ended_at, s.started_at) AS session_ended_at,
-				-1 AS ordinal,
-				0 AS match_pos,
-				CASE
-					WHEN COALESCE(s.display_name, s.session_name) ILIKE '%%' || $1 || '%%' ESCAPE E'\\'
-						THEN COALESCE(s.display_name, s.session_name, '')
-					WHEN s.first_message ILIKE '%%' || $1 || '%%' ESCAPE E'\\'
-						THEN COALESCE(s.first_message, '')
-					ELSE COALESCE(s.display_name, s.session_name, s.first_message, '')
-				END AS snippet
-			FROM sessions s
-			WHERE (COALESCE(s.display_name, s.session_name) ILIKE '%%' || $1 || '%%' ESCAPE E'\\'
-				OR s.first_message ILIKE '%%' || $1 || '%%' ESCAPE E'\\')
-				AND s.deleted_at IS NULL
-				AND EXISTS (
-					SELECT 1 FROM messages mx
-					WHERE mx.session_id = s.id
-					  AND mx.is_system = FALSE
-					  AND `+db.PostgresSystemPrefixSQL("mx.content", "mx.role")+`
-				)
-				AND s.id NOT IN (SELECT session_id FROM msg_matches)
-				%s
 		)
-		-- rank is a constant 1.0 because PostgreSQL ILIKE has no
-	-- relevance scoring engine (unlike SQLite FTS5). Ordering
-	-- uses match_pos and session_ended_at instead.
-	SELECT session_id, project, agent, name,
-			session_ended_at, ordinal,
-			snippet, 1.0 AS rank, match_pos
-		FROM (
-			SELECT *, 1 AS match_priority FROM msg_matches
-			UNION ALL
-			SELECT *, 2 AS match_priority FROM name_matches
-		) combined
+		SELECT s.id, s.project, s.agent,
+			COALESCE(s.display_name, s.session_name, s.first_message, '') AS name,
+			COALESCE(s.ended_at, s.started_at) AS session_ended_at,
+			COALESCE(mb.ordinal, -1) AS ordinal,
+			CASE
+				WHEN mb.snippet IS NOT NULL THEN mb.snippet
+				WHEN COALESCE(s.display_name, s.session_name, '') ILIKE %s ESCAPE E'\\'
+					THEN COALESCE(s.display_name, s.session_name, '')
+				WHEN COALESCE(s.first_message, '') ILIKE %s ESCAPE E'\\'
+					THEN COALESCE(s.first_message, '')
+				WHEN s.id ILIKE %s ESCAPE E'\\' THEN s.id
+				WHEN s.project ILIKE %s ESCAPE E'\\' THEN s.project
+				WHEN s.agent ILIKE %s ESCAPE E'\\' THEN s.agent
+				WHEN COALESCE(s.git_branch, '') ILIKE %s ESCAPE E'\\' THEN s.git_branch
+				WHEN COALESCE(s.cwd, '') ILIKE %s ESCAPE E'\\' THEN s.cwd
+				ELSE COALESCE(s.display_name, s.session_name, s.first_message, '')
+			END AS snippet,
+			1.0 AS rank,
+			COALESCE(mb.match_pos, 0) AS match_pos,
+			CASE
+				WHEN LOWER(COALESCE(s.display_name, s.session_name, '')) = LOWER(%s)
+					OR LOWER(s.id) = LOWER(%s) THEN %d
+				WHEN LOWER(s.project) = LOWER(%s)
+					OR LOWER(s.agent) = LOWER(%s)
+					OR LOWER(COALESCE(s.agent_label, '')) = LOWER(%s) THEN %d
+				WHEN mb.session_id IS NOT NULL AND %s = 1 THEN %d
+				WHEN COALESCE(s.display_name, s.session_name, '') ILIKE %s ESCAPE E'\\'
+					OR s.id ILIKE %s ESCAPE E'\\'
+					OR s.project ILIKE %s ESCAPE E'\\'
+					OR s.agent ILIKE %s ESCAPE E'\\' THEN %d
+				WHEN %s THEN %d
+				WHEN mb.session_id IS NOT NULL THEN %d
+				ELSE %d
+			END AS relevance
+		FROM matched mt
+		JOIN sessions s ON s.id = mt.session_id
+		LEFT JOIN msg_best mb ON mb.session_id = s.id
+		WHERE s.deleted_at IS NULL
+		  AND EXISTS (
+			SELECT 1 FROM messages mx
+			WHERE mx.session_id = s.id
+			  AND mx.is_system = FALSE
+			  AND %s
+		  )
+		  %s
 		ORDER BY %s
-		LIMIT $%d OFFSET $%d`,
-		msgTermPredicate,
-		msgProjectClause,
-		nameProjectClause,
-		outerOrderBy,
-		argIdx, argIdx+1,
+		LIMIT %s OFFSET %s`,
+		firstRaw, firstRaw, firstRaw, sysMsg, firstLike, firstRaw,
+		firstLike, firstLike, firstLike, firstLike, firstLike, firstLike, firstLike,
+		plainPh, plainPh, db.SearchRankExactValue,
+		plainPh, plainPh, plainPh, db.SearchRankExactPrimary,
+		hasPhrasePh, db.SearchRankExactPhrase,
+		prefixPh, prefixPh, prefixPh, prefixPh, db.SearchRankPrefixPrimary,
+		primaryPred, db.SearchRankAllTermsPrimary,
+		db.SearchRankAllTermsContent, db.SearchRankSubstring,
+		sysVis, projectClause, outerOrderBy, limitPh, offsetPh,
 	)
-	args = append(args, f.Limit+1, f.Cursor)
+
+	query := b.String()
 
 	rows, err := s.pg.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -485,10 +529,11 @@ func (s *Store) Search(
 		var r db.SearchResult
 		var endedAt *time.Time
 		var matchPos int
+		var relevance int
 		if err := rows.Scan(
 			&r.SessionID, &r.Project, &r.Agent, &r.Name,
 			&endedAt, &r.Ordinal,
-			&r.Snippet, &r.Rank, &matchPos,
+			&r.Snippet, &r.Rank, &matchPos, &relevance,
 		); err != nil {
 			return db.SearchPage{},
 				fmt.Errorf(

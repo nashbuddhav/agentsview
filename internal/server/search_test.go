@@ -31,6 +31,7 @@ func TestPrepareFTSQuery(t *testing.T) {
 		{name: "empty string unchanged", raw: "", want: ""},
 		{name: "whitespace only trimmed to empty", raw: "   ", want: ""},
 		{name: "leading and trailing space trimmed", raw: "  login  ", want: `"login"`},
+		{name: "mixed phrase and term", raw: `"fix bug" extra`, want: `"fix bug" "extra"`},
 	}
 
 	for _, tt := range tests {

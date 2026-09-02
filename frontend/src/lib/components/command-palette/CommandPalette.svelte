@@ -46,27 +46,17 @@
     searchStore.resetSort();
   });
 
-  // Filtered recent sessions (client-side filter)
+  // Recent sessions when the query is empty or whitespace-only.
+  let queryTrimmed = $derived(inputValue.trim());
   let recentSessions = $derived.by(() => {
-    if (inputValue.length > 0 && inputValue.length < 3) {
-      const q = inputValue.toLowerCase();
-      return sessions.sessions
-        .filter(
-          (s) =>
-            s.project.toLowerCase().includes(q) ||
-            (s.display_name?.toLowerCase().includes(q) ?? false) ||
-            (s.first_message?.toLowerCase().includes(q) ?? false),
-        )
-        .slice(0, 10);
+    if (queryTrimmed) {
+      return [];
     }
-    if (!inputValue) {
-      return sessions.sessions.slice(0, 10);
-    }
-    return [];
+    return sessions.sessions.slice(0, 10);
   });
 
-  // Combined results: search results when query >= 3 chars, else recent
-  let showSearchResults = $derived(inputValue.length >= 3);
+  // Search results for any non-empty query, including single words.
+  let showSearchResults = $derived(queryTrimmed.length > 0);
 
   let totalItems = $derived(
     showSearchResults
@@ -79,7 +69,7 @@
     inputValue = target.value;
     selectedIndex = 0;
 
-    if (inputValue.length >= 3) {
+    if (inputValue.trim()) {
       searchStore.search(inputValue, sessions.filters.project);
     } else {
       searchStore.clear();

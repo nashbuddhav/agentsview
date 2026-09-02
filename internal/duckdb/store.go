@@ -897,45 +897,45 @@ func (s *Store) Search(ctx context.Context, f db.SearchFilter) (db.SearchPage, e
 	if f.Limit <= 0 || f.Limit > db.MaxSearchLimit {
 		f.Limit = db.DefaultSearchLimit
 	}
-	if f.Query == "" {
+	terms := db.SearchTermsFromQuery(f.Query)
+	if len(terms) == 0 {
 		return db.SearchPage{}, nil
 	}
-	// plainTerm is the de-quoted query joined back into one string. It feeds the
-	// name-branch ILIKE (matching the typed text against the short session name)
-	// and centers the message snippet via match_pos, mirroring SQLite's
-	// plainQuery and PostgreSQL's plainTerm. terms is the per-term
-	// decomposition: every term must appear in the message content (AND),
-	// matching SQLite FTS5's implicit AND so the same user query behaves
-	// identically across backends. An explicit exact phrase (user-supplied
-	// leading quote) collapses to a single term, preserving the exact-phrase
-	// opt-in.
-	plainTerm := db.StripFTSQuotes(f.Query)
-	terms := db.FTSTerms(f.Query)
-	if plainTerm == "" || len(terms) == 0 {
-		return db.SearchPage{}, nil
-	}
-	// firstTerm anchors INSTR-based ordering and snippet centering.
-	firstTerm := terms[0]
-	namePattern := "%" + db.EscapeLikePattern(plainTerm) + "%"
+	firstTerm := terms[0].Value
+	blobSQL := db.SessionSearchBlobSQL("s")
 	project := ""
 	nameProject := ""
 	args := []any{firstTerm, firstTerm}
 
-	// Message branch matches every term (AND). Each term gets its own escaped
-	// ILIKE placeholder so a multi-word query requires all terms to be present
-	// without demanding they be contiguous, exactly like SQLite FTS5.
 	termClauses := make([]string, len(terms))
 	for i, t := range terms {
-		termClauses[i] = "m.content ILIKE ? ESCAPE '\\'"
-		args = append(args, "%"+db.EscapeLikePattern(t)+"%")
+		like := db.SearchLikePattern(t.Value)
+		termClauses[i] = `(m.content ILIKE ? ESCAPE '\'
+				OR m.model ILIKE ? ESCAPE '\'
+				OR EXISTS (
+					SELECT 1 FROM tool_calls tc
+					WHERE tc.session_id = m.session_id
+					  AND (tc.tool_name ILIKE ? ESCAPE '\'
+					    OR COALESCE(tc.skill_name, '') ILIKE ? ESCAPE '\'
+					    OR COALESCE(tc.file_path, '') ILIKE ? ESCAPE '\')))`
+		args = append(args, like, like, like, like, like)
 	}
 	msgTermPredicate := strings.Join(termClauses, "\n\t\t\t\tAND ")
+	nameClauses := make([]string, len(terms))
+	var nameLikeArgs []any
+	for i, t := range terms {
+		nameClauses[i] = blobSQL + " ILIKE ? ESCAPE '\\'"
+		nameLikeArgs = append(nameLikeArgs, db.SearchLikePattern(t.Value))
+	}
+	namePred := strings.Join(nameClauses, " AND ")
 	if f.Project != "" {
 		project = "AND s.project = ?"
 		args = append(args, f.Project)
 		nameProject = "AND s.project = ?"
 	}
-	args = append(args, namePattern, namePattern, namePattern, namePattern)
+	firstLike := db.SearchLikePattern(firstTerm)
+	args = append(args, firstLike, firstLike)
+	args = append(args, nameLikeArgs...)
 	if f.Project != "" {
 		args = append(args, f.Project)
 	}
@@ -985,8 +985,7 @@ func (s *Store) Search(ctx context.Context, f db.SearchFilter) (db.SearchPage, e
 				END AS snippet,
 				1.0 AS rank, 2 AS match_priority, 0 AS match_pos
 			FROM sessions s
-			WHERE (COALESCE(s.display_name, s.session_name) ILIKE ? ESCAPE '\'
-				OR s.first_message ILIKE ? ESCAPE '\')
+			WHERE (`+namePred+`)
 				AND s.deleted_at IS NULL
 				AND EXISTS (
 					SELECT 1 FROM messages mx
@@ -1035,8 +1034,21 @@ func (s *Store) Search(ctx context.Context, f db.SearchFilter) (db.SearchPage, e
 }
 
 func (s *Store) SearchSession(ctx context.Context, sessionID, query string) ([]int, error) {
-	if query == "" {
+	terms := db.SearchTermsFromQuery(query)
+	if len(terms) == 0 {
 		return nil, nil
+	}
+	args := []any{sessionID}
+	var pred strings.Builder
+	for i, t := range terms {
+		if i > 0 {
+			pred.WriteString(" AND ")
+		}
+		pred.WriteString(`(m.content ILIKE ? ESCAPE '\'
+				OR tc.result_content ILIKE ? ESCAPE '\'
+				OR tre.content ILIKE ? ESCAPE '\')`)
+		like := db.SearchLikePattern(t.Value)
+		args = append(args, like, like, like)
 	}
 	rows, err := s.queryContext(ctx, `
 		SELECT DISTINCT m.ordinal
@@ -1051,13 +1063,9 @@ func (s *Store) SearchSession(ctx context.Context, sessionID, query string) ([]i
 		WHERE m.session_id = ?
 			AND m.is_system = FALSE
 			AND `+db.DuckDBSystemPrefixSQL("m.content", "m.role")+`
-			AND (m.content ILIKE ? ESCAPE '\'
-				OR tc.result_content ILIKE ? ESCAPE '\'
-				OR tre.content ILIKE ? ESCAPE '\')
+			AND `+pred.String()+`
 		ORDER BY m.ordinal ASC`,
-		sessionID, "%"+db.EscapeLikePattern(query)+"%",
-		"%"+db.EscapeLikePattern(query)+"%",
-		"%"+db.EscapeLikePattern(query)+"%",
+		args...,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("duckdb session search: %w", err)

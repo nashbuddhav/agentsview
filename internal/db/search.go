@@ -12,7 +12,6 @@ import (
 const (
 	DefaultSearchLimit = 50
 	MaxSearchLimit     = 500
-	snippetTokenLength = 32
 )
 
 // SystemMsgPrefixes lists non-goal content prefixes that identify
@@ -326,194 +325,232 @@ type SearchPage struct {
 	NextCursor int            `json:"next_cursor,omitempty"`
 }
 
-// Search performs FTS5 full-text search across messages, grouped by session,
-// plus a LIKE-based search on session display names and first messages.
+// Search performs session search across message content (FTS5, with prefix
+// matching) and session metadata (id, names, project, agent, paths, tools,
+// models, statuses). Unquoted terms are AND'd in any order and may hit
+// different fields. Quoted phrases must appear together in order.
 //
-// Results come from two branches joined with UNION ALL:
-//
-//  1. FTS branch — message content matches. ROW_NUMBER() picks the single
-//     best-ranked message per session (rank ASC, ordinal ASC, rowid ASC).
-//     The outer JOIN messages_fts includes a MATCH clause to prevent segment
-//     duplicates. Ordinal is the matched message's ordinal (≥ 0).
-//
-//  2. Name branch — display_name / first_message LIKE matches that are NOT
-//     already covered by the FTS branch. Ordinal is -1 (no specific message
-//     to navigate to).
+// Each matching session appears once. Relevance ranking (see SearchRank*
+// constants) is the default order; Sort "recency" orders by session time.
 func (db *DB) Search(
 	ctx context.Context, f SearchFilter,
 ) (SearchPage, error) {
 	if f.Limit <= 0 || f.Limit > MaxSearchLimit {
 		f.Limit = DefaultSearchLimit
 	}
-	f.Query = PrepareFTSQuery(f.Query)
-
-	// ORDER BY for the outer query. FTS5 ranks are negative (lower = better),
-	// so rank ASC places message matches (negative rank) before name-only rows
-	// (rank=0.0). Within FTS results, match_pos ASC prefers earlier positions.
-	// julianday() normalises RFC3339Nano text to a numeric value, avoiding
-	// lexicographic misorderings from variable fractional-second precision
-	// (e.g. "…T12:00:00Z" vs "…T12:00:00.123Z"). SQLite NULLs sort smaller
-	// than any value, so julianday(NULL) DESC naturally places NULLs last.
-	orderBy := "rank ASC, match_pos ASC, julianday(session_ended_at) DESC, session_id ASC"
-	if f.Sort == "recency" {
-		orderBy = "julianday(session_ended_at) DESC, session_id ASC"
-	}
-
-	// innerWhere is used in three places: the ROW_NUMBER inner subquery,
-	// the outer MATCH re-filter, and the NOT IN subquery for the name branch.
-	innerWhere := []string{
-		"messages_fts MATCH ?",
-		"s2.deleted_at IS NULL",
-		"m2.is_system = 0",
-		SystemPrefixSQL("m2.content", "m2.role"),
-	}
-	ftsArgs := []any{f.Query} // args for one copy of innerWhere
-
-	nameProjectClause := ""
-	var nameProjectArgs []any
-	if f.Project != "" {
-		innerWhere = append(innerWhere, "s2.project = ?")
-		ftsArgs = append(ftsArgs, f.Project)
-		nameProjectClause = "AND s.project = ?"
-		nameProjectArgs = []any{f.Project}
-	}
-
-	innerWhereSQL := strings.Join(innerWhere, " AND ")
-	// Strip FTS quoting before substring operations. PrepareFTSQuery wraps
-	// each term in double quotes for FTS (e.g. "fix bug" → `"fix" "bug"`).
-	// LIKE and instr() must use the plain text form so name/content substring
-	// searches work correctly.
-	plainQuery := StripFTSQuotes(f.Query)
-	if plainQuery == "" {
+	terms := SearchTermsFromQuery(f.Query)
+	if len(terms) == 0 {
 		return SearchPage{}, nil
 	}
-	likePattern := "%" + escapeLike(plainQuery) + "%"
+	var ftsTerms []SearchTerm
+	for _, t := range terms {
+		if ftsSearchable(t.Value) {
+			ftsTerms = append(ftsTerms, t)
+		}
+	}
+	ftsExpr := FTSMatchExpression(ftsTerms)
+	plainQuery := JoinedQuery(terms)
+	firstTerm := terms[0].Value
+	hasPhrase := 0
+	if HasQuotedPhrase(terms) {
+		hasPhrase = 1
+	}
 
-	// Build args in the order the SQL placeholders appear.
-	// Position 0 (? AS best_query in the ROW_NUMBER SELECT) is
-	// prepended after this block — see args2 below.
-	//
-	//  pos | SQL clause                                  | value
-	//  ----+---------------------------------------------+------------
-	//   0  | SELECT ? AS best_query (ROW_NUMBER)         | plainQuery  ← prepended in args2
-	//   1  | WHERE messages_fts MATCH ? (ROW_NUMBER)     | ftsArgs[0] (f.Query)
-	//  [1+]| AND s2.project = ? (if project set)         | ftsArgs[1] (f.Project)
-	//   2  | WHERE messages_fts MATCH ? (outer JOIN)     | f.Query
-	//   3  | WHEN COALESCE(display_name,session_name) LIKE ? (CASE) | likePattern
-	//   4  | WHEN s.first_message LIKE ? (CASE)          | likePattern
-	//   5  | WHERE COALESCE(display_name,session_name) LIKE ? (name WHERE) | likePattern
-	//   6  | WHERE s.first_message LIKE ? (name WHERE)   | likePattern
-	//  [7] | AND s.project = ? (name branch, optional)   | f.Project
-	//   8  | WHERE messages_fts MATCH ? (NOT IN)         | ftsArgs[0]
-	//  [8+]| AND s2.project = ? (NOT IN, if set)         | ftsArgs[1]
-	//   9  | LIMIT ? OFFSET ?                            | f.Limit+1, f.Cursor
-	args := make([]any, 0, len(ftsArgs)*2+6+len(nameProjectArgs))
-	args = append(args, ftsArgs...)          // (1) ROW_NUMBER WHERE
-	args = append(args, f.Query)             // (2) outer MATCH re-filter
-	args = append(args, likePattern)         // (3) CASE COALESCE(display_name,session_name) LIKE
-	args = append(args, likePattern)         // (4) CASE first_message LIKE
-	args = append(args, likePattern)         // (5) name WHERE COALESCE(display_name,session_name) LIKE
-	args = append(args, likePattern)         // (6) name WHERE first_message LIKE
-	args = append(args, nameProjectArgs...)  // (7) optional name branch project
-	args = append(args, ftsArgs...)          // (8) NOT IN WHERE
-	args = append(args, f.Limit+1, f.Cursor) // (9) LIMIT / OFFSET
+	orderBy := "relevance ASC, rank ASC, match_pos ASC, julianday(session_ended_at) DESC, s.id ASC"
+	if f.Sort == "recency" {
+		orderBy = "julianday(session_ended_at) DESC, s.id ASC"
+	}
 
-	query := fmt.Sprintf(`
-		SELECT session_id, project, agent, name,
-			session_ended_at, ordinal, snippet, rank, match_pos
-		FROM (
-			-- FTS branch: message content matches
-			SELECT m.session_id, s.project, s.agent,
-				COALESCE(s.display_name, s.session_name, s.first_message, '') AS name,
-				COALESCE(s.ended_at, s.started_at, '') AS session_ended_at,
-				best.best_ordinal AS ordinal,
-				snippet(messages_fts, 0, '<mark>', '</mark>',
-					'...', %d) AS snippet,
-				best.best_rank AS rank,
-				instr(LOWER(m.content), LOWER(best.best_query))
-					AS match_pos
-			FROM (
-				SELECT session_id, best_rowid, best_ordinal, best_rank, best_query
-				FROM (
-					SELECT m2.session_id,
-						messages_fts.rowid AS best_rowid,
-						m2.ordinal AS best_ordinal,
-						rank AS best_rank,
-						? AS best_query,
-						ROW_NUMBER() OVER (
-							PARTITION BY m2.session_id
-							ORDER BY rank ASC, m2.ordinal ASC,
-								messages_fts.rowid ASC
-						) AS rn
-					FROM messages_fts
-					JOIN messages m2 ON messages_fts.rowid = m2.id
-					JOIN sessions s2 ON m2.session_id = s2.id
-					WHERE %s
-				)
-				WHERE rn = 1
-			) AS best
-			JOIN messages_fts ON messages_fts.rowid = best.best_rowid
-			JOIN messages m ON m.id = best.best_rowid
-			JOIN sessions s ON m.session_id = s.id
+	blobSQL := SessionSearchBlobSQL("s")
+	primarySQL := SessionPrimaryBlobSQL("s")
+	sysPrefix := SystemPrefixSQL("m2.content", "m2.role")
+	visiblePrefix := SystemPrefixSQL("mx.content", "mx.role")
+
+	var b strings.Builder
+	b.WriteString("WITH ")
+	args := make([]any, 0, 16+len(terms)*8)
+
+	for i, t := range terms {
+		if i > 0 {
+			b.WriteString(",\n")
+		}
+		like := SearchLikePattern(t.Value)
+		ftsPart := `SELECT NULL AS session_id WHERE 0`
+		if ftsSearchable(t.Value) {
+			ftsPart = fmt.Sprintf(`SELECT m2.session_id AS session_id
+			FROM messages_fts
+			JOIN messages m2 ON messages_fts.rowid = m2.id
+			JOIN sessions s2 ON m2.session_id = s2.id
 			WHERE messages_fts MATCH ?
+			  AND s2.deleted_at IS NULL
+			  AND m2.is_system = 0
+			  AND %s`, sysPrefix)
+			args = append(args, FTSMatchExpression([]SearchTerm{t}))
+		}
+		fmt.Fprintf(&b, `term%d AS (
+			%s
+			UNION
+			SELECT s.id FROM sessions s
+			WHERE s.deleted_at IS NULL
+			  AND LOWER(%s) LIKE LOWER(?) ESCAPE '\'
+			UNION
+			SELECT m.session_id FROM messages m
+			JOIN sessions s ON s.id = m.session_id
+			WHERE s.deleted_at IS NULL
+			  AND LOWER(m.model) LIKE LOWER(?) ESCAPE '\'
+			UNION
+			SELECT tc.session_id FROM tool_calls tc
+			JOIN sessions s ON s.id = tc.session_id
+			WHERE s.deleted_at IS NULL
+			  AND (
+			    LOWER(tc.tool_name) LIKE LOWER(?) ESCAPE '\'
+			    OR LOWER(COALESCE(tc.skill_name, '')) LIKE LOWER(?) ESCAPE '\'
+			    OR LOWER(COALESCE(tc.file_path, '')) LIKE LOWER(?) ESCAPE '\'
+			  )
+		)`, i, ftsPart, blobSQL)
+		args = append(args, like, like, like, like, like)
+	}
 
-			UNION ALL
+	b.WriteString(",\nmatched AS (\n")
+	for i := range terms {
+		if i > 0 {
+			b.WriteString(" INTERSECT ")
+		}
+		fmt.Fprintf(&b, "SELECT session_id FROM term%d", i)
+	}
+	b.WriteString("\n)")
 
-			-- Name branch: display_name / session_name / first_message matches not in FTS branch
-			SELECT s.id, s.project, s.agent,
-				COALESCE(s.display_name, s.session_name, s.first_message, '') AS name,
-				COALESCE(s.ended_at, s.started_at, '') AS session_ended_at,
-				-1 AS ordinal,
-				CASE
-					WHEN COALESCE(s.display_name, s.session_name) LIKE ? ESCAPE '\'
-						THEN COALESCE(s.display_name, s.session_name, '')
-					WHEN s.first_message LIKE ? ESCAPE '\'
-						THEN COALESCE(s.first_message, '')
-					ELSE COALESCE(s.display_name, s.session_name, s.first_message, '')
-				END AS snippet,
-				0.0 AS rank,
-				0 AS match_pos
-			FROM sessions s
-			WHERE (COALESCE(s.display_name, s.session_name) LIKE ? ESCAPE '\'
-				OR s.first_message LIKE ? ESCAPE '\')
-				AND s.deleted_at IS NULL
-				AND EXISTS (
-					SELECT 1 FROM messages mx
-					WHERE mx.session_id = s.id
-					  AND mx.is_system = 0
-					  AND `+SystemPrefixSQL("mx.content", "mx.role")+`
-				)
-				%s
-				AND s.id NOT IN (
-					SELECT m2.session_id
-					FROM messages_fts
-					JOIN messages m2 ON messages_fts.rowid = m2.id
-					JOIN sessions s2 ON m2.session_id = s2.id
-					WHERE %s
-				)
-		)
-		ORDER BY %s
-		LIMIT ? OFFSET ?`,
-		snippetTokenLength,
-		innerWhereSQL,     // ROW_NUMBER inner WHERE (%s at rn subquery)
-		nameProjectClause, // optional project filter for name branch (%s)
-		innerWhereSQL,     // NOT IN subquery WHERE (%s)
-		orderBy,           // ORDER BY (%s)
+	projectFTS := ""
+	if f.Project != "" {
+		projectFTS = "AND s2.project = ?"
+	}
+	if ftsExpr != "" {
+		fmt.Fprintf(&b, `,
+		fts_best AS (
+			SELECT session_id, best_rowid, best_ordinal, best_rank, best_query
+			FROM (
+				SELECT m2.session_id,
+					messages_fts.rowid AS best_rowid,
+					m2.ordinal AS best_ordinal,
+					rank AS best_rank,
+					? AS best_query,
+					ROW_NUMBER() OVER (
+						PARTITION BY m2.session_id
+						ORDER BY rank ASC, m2.ordinal ASC, messages_fts.rowid ASC
+					) AS rn
+				FROM messages_fts
+				JOIN messages m2 ON messages_fts.rowid = m2.id
+				JOIN sessions s2 ON m2.session_id = s2.id
+				WHERE messages_fts MATCH ?
+				  AND s2.deleted_at IS NULL
+				  AND m2.is_system = 0
+				  AND %s
+				  %s
+			)
+			WHERE rn = 1
+		)`, sysPrefix, projectFTS)
+	} else {
+		b.WriteString(`,
+		fts_best AS (
+			SELECT NULL AS session_id, NULL AS best_rowid,
+				NULL AS best_ordinal, NULL AS best_rank, NULL AS best_query
+			WHERE 0
+		)`)
+	}
+	fmt.Fprintf(&b, `
+		SELECT s.id, s.project, s.agent,
+			COALESCE(s.display_name, s.session_name, s.first_message, '') AS name,
+			COALESCE(s.ended_at, s.started_at, '') AS session_ended_at,
+			COALESCE(best.best_ordinal, -1) AS ordinal,
+			CASE
+				WHEN m.content IS NOT NULL THEN CASE
+					WHEN instr(LOWER(m.content), LOWER(best.best_query)) > 100
+						THEN '...' || substr(m.content, max(1, instr(LOWER(m.content), LOWER(best.best_query)) - 50), 200) || '...'
+					ELSE substr(m.content, 1, 200) || CASE WHEN length(m.content) > 200 THEN '...' ELSE '' END
+				END
+				WHEN LOWER(COALESCE(s.display_name, s.session_name, '')) LIKE LOWER(?) ESCAPE '\'
+					THEN COALESCE(s.display_name, s.session_name, '')
+				WHEN LOWER(COALESCE(s.first_message, '')) LIKE LOWER(?) ESCAPE '\'
+					THEN COALESCE(s.first_message, '')
+				WHEN LOWER(s.id) LIKE LOWER(?) ESCAPE '\' THEN s.id
+				WHEN LOWER(s.project) LIKE LOWER(?) ESCAPE '\' THEN s.project
+				WHEN LOWER(s.agent) LIKE LOWER(?) ESCAPE '\' THEN s.agent
+				WHEN LOWER(COALESCE(s.git_branch, '')) LIKE LOWER(?) ESCAPE '\' THEN s.git_branch
+				WHEN LOWER(COALESCE(s.cwd, '')) LIKE LOWER(?) ESCAPE '\' THEN s.cwd
+				ELSE COALESCE(s.display_name, s.session_name, s.first_message, '')
+			END AS snippet,
+			COALESCE(best.best_rank, 0.0) AS rank,
+			CASE
+				WHEN best.best_query IS NOT NULL
+					THEN instr(LOWER(m.content), LOWER(best.best_query))
+				ELSE 0
+			END AS match_pos,
+			CASE
+				WHEN LOWER(COALESCE(s.display_name, s.session_name, '')) = LOWER(?)
+					OR LOWER(s.id) = LOWER(?) THEN %d
+				WHEN LOWER(s.project) = LOWER(?)
+					OR LOWER(s.agent) = LOWER(?)
+					OR LOWER(COALESCE(s.agent_label, '')) = LOWER(?) THEN %d
+				WHEN best.best_rowid IS NOT NULL AND ? = 1 THEN %d
+				WHEN LOWER(COALESCE(s.display_name, s.session_name, '')) LIKE LOWER(?) ESCAPE '\'
+					OR LOWER(s.id) LIKE LOWER(?) ESCAPE '\'
+					OR LOWER(s.project) LIKE LOWER(?) ESCAPE '\'
+					OR LOWER(s.agent) LIKE LOWER(?) ESCAPE '\' THEN %d
+				WHEN %s THEN %d
+				WHEN best.best_rowid IS NOT NULL THEN %d
+				ELSE %d
+			END AS relevance
+		FROM matched mt
+		JOIN sessions s ON s.id = mt.session_id
+		LEFT JOIN fts_best best ON best.session_id = s.id
+		LEFT JOIN messages m ON m.id = best.best_rowid
+		WHERE s.deleted_at IS NULL
+		  AND EXISTS (
+			SELECT 1 FROM messages mx
+			WHERE mx.session_id = s.id
+			  AND mx.is_system = 0
+			  AND %s
+		  )`,
+		SearchRankExactValue, SearchRankExactPrimary, SearchRankExactPhrase,
+		SearchRankPrefixPrimary,
+		sqliteAllTermsPrimarySQL(len(terms), primarySQL),
+		SearchRankAllTermsPrimary, SearchRankAllTermsContent, SearchRankSubstring,
+		visiblePrefix,
 	)
 
-	// Replace the ROW_NUMBER inner subquery's ? for best_query with args
-	// re-ordered: the first innerWhere param (f.Query) was already included in
-	// ftsArgs above at position (1); best_query needs a second copy of f.Query
-	// injected at the right position. Re-build args with the extra copy.
-	//
-	// The inner subquery's SELECT has `? AS best_query` before the WHERE, so
-	// its ? comes before innerWhere's ?s. Rebuild:
-	args2 := make([]any, 0, len(args)+1)
-	args2 = append(args2, plainQuery) // best_query: plain text for instr()
-	args2 = append(args2, args...)
-	args = args2
+	if ftsExpr != "" {
+		args = append(args, firstTerm, ftsExpr)
+		if f.Project != "" {
+			args = append(args, f.Project)
+		}
+	}
 
-	rows, err := db.getReader().QueryContext(ctx, query, args...)
+	firstLike := SearchLikePattern(firstTerm)
+	for range 7 {
+		args = append(args, firstLike)
+	}
+
+	args = append(args, plainQuery, plainQuery)
+	args = append(args, plainQuery, plainQuery, plainQuery)
+	args = append(args, hasPhrase)
+	prefixPat := SearchPrefixPattern(plainQuery)
+	for range 4 {
+		args = append(args, prefixPat)
+	}
+	for _, t := range terms {
+		args = append(args, SearchLikePattern(t.Value))
+	}
+
+	if f.Project != "" {
+		b.WriteString(" AND s.project = ?")
+		args = append(args, f.Project)
+	}
+	fmt.Fprintf(&b, `
+		ORDER BY %s
+		LIMIT ? OFFSET ?`, orderBy)
+	args = append(args, f.Limit+1, f.Cursor)
+
+	rows, err := db.getReader().QueryContext(ctx, b.String(), args...)
 	if err != nil {
 		return SearchPage{}, fmt.Errorf("searching: %w", err)
 	}
@@ -523,13 +560,17 @@ func (db *DB) Search(
 	for rows.Next() {
 		var r SearchResult
 		var matchPos int
+		var relevance int
 		if err := rows.Scan(
 			&r.SessionID, &r.Project, &r.Agent, &r.Name,
 			&r.SessionEndedAt, &r.Ordinal,
-			&r.Snippet, &r.Rank, &matchPos,
+			&r.Snippet, &r.Rank, &matchPos, &relevance,
 		); err != nil {
 			return SearchPage{},
 				fmt.Errorf("scanning result: %w", err)
+		}
+		if r.Ordinal >= 0 {
+			r.Snippet = highlightSearchSnippet(r.Snippet, firstTerm)
 		}
 		results = append(results, r)
 	}
@@ -545,6 +586,29 @@ func (db *DB) Search(
 	return page, nil
 }
 
+func highlightSearchSnippet(snippet, term string) string {
+	if snippet == "" || term == "" {
+		return snippet
+	}
+	idx := strings.Index(strings.ToLower(snippet), strings.ToLower(term))
+	if idx < 0 {
+		return snippet
+	}
+	end := idx + len(term)
+	if end > len(snippet) {
+		return snippet
+	}
+	return snippet[:idx] + "<mark>" + snippet[idx:end] + "</mark>" + snippet[end:]
+}
+
+func sqliteAllTermsPrimarySQL(n int, primarySQL string) string {
+	parts := make([]string, n)
+	for i := range n {
+		parts[i] = "LOWER(" + primarySQL + ") LIKE LOWER(?) ESCAPE '\\'"
+	}
+	return "(" + strings.Join(parts, " AND ") + ")"
+}
+
 // SearchSession performs a case-insensitive substring search within a single
 // session's messages, returning matching ordinals in document order.
 // This is used by the in-session find bar (analogous to browser Cmd+F).
@@ -554,15 +618,26 @@ func (db *DB) Search(
 func (db *DB) SearchSession(
 	ctx context.Context, sessionID, query string,
 ) ([]int, error) {
-	if query == "" {
+	terms := ParseUserQuery(query)
+	if len(terms) == 0 {
 		return nil, nil
 	}
-	// Use LIKE for substring semantics consistent with browser find-bar UX.
+	// LIKE substring per term, AND'd. Quoted phrases stay contiguous.
 	// SQLite LIKE is case-insensitive for ASCII by default.
 	// LEFT JOIN tool_calls so that a hit in result_content also surfaces
 	// the parent message ordinal; DISTINCT collapses multiple tool calls
 	// on the same message into a single result.
-	like := "%" + escapeLike(query) + "%"
+	var pred strings.Builder
+	args := []any{sessionID}
+	for i, t := range terms {
+		if i > 0 {
+			pred.WriteString(" AND ")
+		}
+		pred.WriteString(`(m.content LIKE ? ESCAPE '\'
+		        OR tc.result_content LIKE ? ESCAPE '\')`)
+		like := SearchLikePattern(t.Value)
+		args = append(args, like, like)
+	}
 	rows, err := db.getReader().QueryContext(ctx,
 		`SELECT DISTINCT m.ordinal
 		 FROM messages m
@@ -570,10 +645,9 @@ func (db *DB) SearchSession(
 		 WHERE m.session_id = ?
 		   AND m.is_system = 0
 		   AND `+SystemPrefixSQL("m.content", "m.role")+`
-		   AND (m.content LIKE ? ESCAPE '\'
-		        OR tc.result_content LIKE ? ESCAPE '\')
+		   AND `+pred.String()+`
 		 ORDER BY m.ordinal ASC`,
-		sessionID, like, like,
+		args...,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("session search: %w", err)
@@ -592,33 +666,24 @@ func (db *DB) SearchSession(
 }
 
 // PrepareFTSQuery turns a user's raw search input into a well-formed SQLite
-// FTS5 MATCH expression. Each whitespace-separated term is wrapped in double
-// quotes (with any embedded quote doubled, per FTS5 escaping), which makes
-// punctuation literal inside the term and combines the terms under FTS5's
-// implicit AND. Quoting is what prevents a single token containing an FTS5
-// operator character (e.g. "error-401" or "status:500") from being parsed as
-// query syntax and raising a malformed-query error (an HTTP 500).
+// FTS5 MATCH expression. Terms are quoted (embedded quotes doubled) so
+// punctuation such as '-' or ':' is literal and cannot 500 the MATCH parser.
+// Unquoted words combine under FTS5's implicit AND. Quoted spans, including
+// mixed `"exact phrase" other` input, stay phrases.
 //
-// An empty/whitespace-only input is returned unchanged. An input the caller
-// already opened with a double quote is treated as a deliberate FTS5 expression
-// (including an explicit "exact phrase") and is passed through untouched, so
-// exact-phrase matching remains opt-in via a leading quote.
-//
-// This is the single source of truth shared by the SQLite, PostgreSQL, and HTTP
-// search paths so the same user query behaves identically across backends.
+// Empty or whitespace-only input returns "". This is the shared quoting
+// helper for HTTP, SQLite, PostgreSQL, DuckDB, and MCP search paths.
 func PrepareFTSQuery(raw string) string {
-	raw = strings.TrimSpace(raw)
-	if raw == "" || strings.HasPrefix(raw, `"`) {
-		return raw
+	terms := ParseUserQuery(raw)
+	if len(terms) == 0 {
+		return ""
 	}
 	var b strings.Builder
-	for i, term := range strings.Fields(raw) {
+	for i, t := range terms {
 		if i > 0 {
 			b.WriteByte(' ')
 		}
-		b.WriteByte('"')
-		b.WriteString(strings.ReplaceAll(term, `"`, `""`))
-		b.WriteByte('"')
+		b.WriteString(QuoteFTS(t.Value))
 	}
 	return b.String()
 }

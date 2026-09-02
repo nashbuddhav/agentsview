@@ -495,6 +495,7 @@ func TestPrepareFTSQuery(t *testing.T) {
 		{name: "single colon token quoted literal", raw: "status:500", want: `"status:500"`},
 		{name: "embedded quote doubled", raw: `say"hi`, want: `"say""hi"`},
 		{name: "leading quote is passthrough phrase", raw: `"fix bug"`, want: `"fix bug"`},
+		{name: "mixed phrase and term", raw: `"fix bug" extra`, want: `"fix bug" "extra"`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -19,6 +19,7 @@ func TestBuildSearchQuery(t *testing.T) {
 		{"colon token literal", "status:500", `"status:500"`},
 		{"embedded quote doubled", `say"hi`, `"say""hi"`},
 		{"leading quote passthrough", `"fix bug"`, `"fix bug"`},
+		{"mixed phrase and term", `"fix bug" extra`, `"fix bug" "extra"`},
 		{"empty", "", ""},
 		{"whitespace only", "   ", ""},
 	}
