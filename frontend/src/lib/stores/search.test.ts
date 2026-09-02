@@ -155,8 +155,8 @@ describe("SearchStore", () => {
     const store = createSearchStore(memoryStorage());
     searchService.getApiV1Search.mockResolvedValueOnce(fullTextResponse("needle"));
 
-    store.search("needle", "alpha");
-    await runDebounce();
+    store.searchNow("needle", "alpha");
+    await flushMicrotasks();
 
     expect(searchService.getApiV1Search).toHaveBeenCalledWith({
       q: "needle",

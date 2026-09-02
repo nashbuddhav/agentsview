@@ -171,6 +171,22 @@ export class SearchStore {
     this.debouncedSearch(query, this.project);
   }
 
+  // Immediate search for explicit submit (button or Enter). Avoids live
+  // keystroke requests against large archives.
+  searchNow(query: string, project?: string) {
+    this.query = query;
+    if (project !== undefined) this.project = project;
+    this.debouncedSearch.cancel();
+    this.cancelInFlight();
+    if (!query.trim()) {
+      this.results = [];
+      this.error = null;
+      this.isSearching = false;
+      return;
+    }
+    void this.executeSearch(query, this.project);
+  }
+
   setMode(mode: SearchMode) {
     if (mode === this.mode) return;
     this.mode = mode;

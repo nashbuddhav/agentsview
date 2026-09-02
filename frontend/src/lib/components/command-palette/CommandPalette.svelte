@@ -31,6 +31,7 @@
   let inputRef: HTMLInputElement | undefined = $state(undefined);
   let selectedIndex: number = $state(0);
   let inputValue: string = $state(searchStore.query ?? "");
+  let submittedQuery: string = $state("");
   let searchModeOptions = $derived<SegmentedControlOption[]>([
     { value: "fulltext", label: m.command_palette_mode_fulltext() },
     { value: "semantic", label: m.command_palette_mode_semantic() },
@@ -48,6 +49,9 @@
 
   // Recent sessions when the query is empty or whitespace-only.
   let queryTrimmed = $derived(inputValue.trim());
+  let queryIsSubmitted = $derived(
+    submittedQuery.length > 0 && queryTrimmed === submittedQuery,
+  );
   let recentSessions = $derived.by(() => {
     if (queryTrimmed) {
       return [];
@@ -55,8 +59,8 @@
     return sessions.sessions.slice(0, 10);
   });
 
-  // Search results for any non-empty query, including single words.
-  let showSearchResults = $derived(queryTrimmed.length > 0);
+  // Results only after an explicit Search / Enter submit.
+  let showSearchResults = $derived(queryIsSubmitted);
 
   let totalItems = $derived(
     showSearchResults
@@ -68,12 +72,22 @@
     const target = e.target as HTMLInputElement;
     inputValue = target.value;
     selectedIndex = 0;
-
-    if (inputValue.trim()) {
-      searchStore.search(inputValue, sessions.filters.project);
-    } else {
+    if (!inputValue.trim()) {
+      submittedQuery = "";
       searchStore.clear();
     }
+  }
+
+  function submitSearch() {
+    selectedIndex = 0;
+    const q = inputValue.trim();
+    if (!q) {
+      submittedQuery = "";
+      searchStore.clear();
+      return;
+    }
+    submittedQuery = q;
+    searchStore.searchNow(inputValue, sessions.filters.project);
   }
 
   function handleKeydown(e: KeyboardEvent) {
@@ -96,7 +110,11 @@
       selectedIndex = Math.max(selectedIndex - 1, 0);
     } else if (e.key === "Enter") {
       e.preventDefault();
-      selectCurrent();
+      if (queryTrimmed && !queryIsSubmitted) {
+        submitSearch();
+      } else {
+        selectCurrent();
+      }
     } else if (e.key === "Escape") {
       e.preventDefault();
       e.stopPropagation();
@@ -220,6 +238,15 @@
         value={inputValue}
         oninput={handleInput}
       />
+      <span class="palette-search-submit">
+        <Button
+          size="sm"
+          tone="info"
+          label={m.command_palette_search_action()}
+          disabled={!queryTrimmed}
+          onclick={submitSearch}
+        />
+      </span>
       <KbdBadge keys={["⎋"]} ariaLabel="Escape" />
     </div>
 
@@ -300,7 +327,7 @@
               ></span>
               <span class="item-body">
                 {#if result.name}
-                  <span class="item-name">{truncate(result.name, 60)}</span>
+                  <span class="item-name">{truncate(result.name, 120)}</span>
                 {/if}
                 {#if result.snippet && result.snippet.replace(/<\/?mark>/g, '') !== result.name}
                   <span class="item-snippet">
@@ -313,7 +340,7 @@
                 {/if}
               </span>
               <span class="item-meta">
-                {truncate(result.project, 20)}{result.timestamp ? ' · ' + formatRelativeTime(result.timestamp) : ''}
+                {truncate(result.project, 40)}{result.timestamp ? ' · ' + formatRelativeTime(result.timestamp) : ''}
               </span>
               <!-- svelte-ignore a11y_click_events_have_key_events -->
               <!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -328,6 +355,8 @@
             </button>
           {/each}
         {/if}
+      {:else if queryTrimmed}
+        <div class="palette-empty">{m.command_palette_search_hint()}</div>
       {:else}
         <div class="palette-section-label">{m.command_palette_recent_sessions()}</div>
         {#each recentSessions as session, i}
@@ -341,7 +370,7 @@
             <span class="item-dot" style:background={agentColor(session.agent)}></span>
             <span class="item-body">
               <span class="item-name">{preview
-                ? truncate(preview, 60)
+                ? truncate(preview, 120)
                 : session.project}</span>
             </span>
             <span class="item-meta">
@@ -362,13 +391,14 @@
     background: var(--overlay-bg);
     display: flex;
     justify-content: center;
-    padding-top: 20vh;
+    padding-top: 8vh;
     z-index: var(--z-overlay);
   }
 
   .palette {
-    width: 560px;
-    max-height: 400px;
+    width: 75vw;
+    max-width: 1400px;
+    max-height: 75vh;
     background: var(--bg-surface);
     border: 1px solid var(--border-default);
     border-radius: var(--radius-lg);
@@ -389,6 +419,10 @@
   :global(.search-icon) {
     flex-shrink: 0;
     color: var(--text-muted);
+  }
+
+  .palette-search-submit {
+    flex-shrink: 0;
   }
 
   .palette-input {

@@ -54,6 +54,7 @@ const {
       mode: "fulltext" as "fulltext" | "semantic" | "hybrid",
       sort: "relevance" as "relevance" | "recency",
       search: vi.fn(),
+      searchNow: vi.fn(),
       clear: vi.fn(),
       resetSort: vi.fn(),
       retry: vi.fn(),
@@ -163,11 +164,26 @@ function makeSearchResult(
   };
 }
 
-async function enterSearchQuery(value = "match") {
+async function typeSearchQuery(value: string) {
   const input = document.querySelector<HTMLInputElement>(".palette-input")!;
   input.value = value;
   input.dispatchEvent(new InputEvent("input", { bubbles: true }));
   await tick();
+}
+
+async function submitSearchQuery() {
+  const button = document.querySelector<HTMLButtonElement>(
+    ".palette-search-submit button",
+  );
+  button?.click();
+  await tick();
+}
+
+async function enterSearchQuery(value = "match") {
+  await typeSearchQuery(value);
+  if (value.trim()) {
+    await submitSearchQuery();
+  }
 }
 
 describe("CommandPalette", () => {
@@ -269,8 +285,31 @@ describe("CommandPalette", () => {
 
     await enterSearchQuery("go");
 
-    expect(mockSearchStore.search).toHaveBeenCalledWith("go", "");
+    expect(mockSearchStore.searchNow).toHaveBeenCalledWith("go", "");
+    expect(mockSearchStore.search).not.toHaveBeenCalled();
     expect(mockSearchStore.clear).not.toHaveBeenCalled();
+
+    unmount(component);
+  });
+
+  it("does not search while typing; Search submits the query", async () => {
+    const component = mount(CommandPalette, {
+      target: document.body,
+    });
+    await tick();
+
+    await typeSearchQuery("market demand");
+    expect(mockSearchStore.searchNow).not.toHaveBeenCalled();
+    expect(mockSearchStore.search).not.toHaveBeenCalled();
+    expect(document.querySelector(".palette-empty")?.textContent).toContain(
+      "Click Search or press Enter",
+    );
+
+    await submitSearchQuery();
+    expect(mockSearchStore.searchNow).toHaveBeenCalledWith(
+      "market demand",
+      "",
+    );
 
     unmount(component);
   });
