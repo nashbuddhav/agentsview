@@ -501,11 +501,8 @@ func (db *DB) Search(
 			COALESCE(s.ended_at, s.started_at, '') AS session_ended_at,
 			COALESCE(best.best_ordinal, hit.ordinal, -1) AS ordinal,
 			CASE
-				WHEN COALESCE(m.content, hit.content) IS NOT NULL THEN CASE
-					WHEN instr(LOWER(COALESCE(m.content, hit.content)), LOWER(COALESCE(best.best_query, hit.hit_query))) > 100
-						THEN '...' || substr(COALESCE(m.content, hit.content), max(1, instr(LOWER(COALESCE(m.content, hit.content)), LOWER(COALESCE(best.best_query, hit.hit_query))) - 50), 200) || '...'
-					ELSE substr(COALESCE(m.content, hit.content), 1, 200) || CASE WHEN length(COALESCE(m.content, hit.content)) > 200 THEN '...' ELSE '' END
-				END
+				WHEN COALESCE(m.content, hit.content) IS NOT NULL THEN
+					substr(COALESCE(m.content, hit.content), 1, 800)
 				WHEN LOWER(COALESCE(s.display_name, s.session_name, '')) LIKE LOWER(?) ESCAPE '\'
 					THEN COALESCE(s.display_name, s.session_name, '')
 				WHEN LOWER(COALESCE(s.first_message, '')) LIKE LOWER(?) ESCAPE '\'
@@ -615,7 +612,7 @@ func (db *DB) Search(
 			return SearchPage{},
 				fmt.Errorf("scanning result: %w", err)
 		}
-		r.Snippet = highlightSearchSnippet(r.Snippet, terms)
+		r.Snippet = windowAndHighlightSnippet(r.Snippet, terms)
 		results = append(results, r)
 	}
 	if err := rows.Err(); err != nil {
@@ -628,6 +625,61 @@ func (db *DB) Search(
 		page.NextCursor = f.Cursor + f.Limit
 	}
 	return page, nil
+}
+
+func windowAndHighlightSnippet(snippet string, terms []SearchTerm) string {
+	return highlightSearchSnippet(windowSnippetAroundTerms(snippet, terms), terms)
+}
+
+func windowSnippetAroundTerms(content string, terms []SearchTerm) string {
+	if content == "" || len(terms) == 0 {
+		return content
+	}
+	lower := strings.ToLower(content)
+	first := -1
+	last := -1
+	for _, t := range terms {
+		if t.Value == "" {
+			continue
+		}
+		needle := strings.ToLower(t.Value)
+		i := strings.Index(lower, needle)
+		if i < 0 {
+			continue
+		}
+		if first < 0 || i < first {
+			first = i
+		}
+		end := i + len(t.Value)
+		if end > last {
+			last = end
+		}
+	}
+	if first < 0 {
+		if len(content) > 240 {
+			return content[:240] + "..."
+		}
+		return content
+	}
+	start := first - 40
+	if start < 0 {
+		start = 0
+	}
+	end := last + 40
+	if end-start < 220 {
+		end = start + 220
+	}
+	if end > len(content) {
+		end = len(content)
+	}
+	out := content[start:end]
+	if start > 0 {
+		out = "..." + out
+	}
+	if end < len(content) {
+		out += "..."
+	}
+	return out
 }
 
 func highlightSearchSnippet(snippet string, terms []SearchTerm) string {
