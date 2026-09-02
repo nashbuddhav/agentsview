@@ -54,6 +54,12 @@ func TestFTSMatchExpression(t *testing.T) {
 	assert.Equal(t, `"fix"* "bug"*`, FTSMatchExpression([]SearchTerm{
 		{Value: "fix"}, {Value: "bug"},
 	}))
+	assert.Equal(t, `"confirm behaviour"`, FTSMatchExpression([]SearchTerm{
+		{Value: "confirm behaviour", Phrase: true},
+	}))
+	assert.Equal(t, `"confirm"`, FTSMatchExpression([]SearchTerm{
+		{Value: "confirm", Phrase: true},
+	}))
 	assert.Equal(t, `"Claude Code"`, FTSMatchExpression([]SearchTerm{
 		{Value: "Claude Code", Phrase: true},
 	}))

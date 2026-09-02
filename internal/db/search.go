@@ -397,7 +397,10 @@ func (db *DB) Search(
 			SELECT m.session_id FROM messages m
 			JOIN sessions s ON s.id = m.session_id
 			WHERE s.deleted_at IS NULL
-			  AND LOWER(m.model) LIKE LOWER(?) ESCAPE '\'
+			  AND m.is_system = 0
+			  AND %s
+			  AND (LOWER(m.content) LIKE LOWER(?) ESCAPE '\'
+			    OR LOWER(m.model) LIKE LOWER(?) ESCAPE '\')
 			UNION
 			SELECT tc.session_id FROM tool_calls tc
 			JOIN sessions s ON s.id = tc.session_id
@@ -406,9 +409,10 @@ func (db *DB) Search(
 			    LOWER(tc.tool_name) LIKE LOWER(?) ESCAPE '\'
 			    OR LOWER(COALESCE(tc.skill_name, '')) LIKE LOWER(?) ESCAPE '\'
 			    OR LOWER(COALESCE(tc.file_path, '')) LIKE LOWER(?) ESCAPE '\'
+			    OR LOWER(COALESCE(tc.result_content, '')) LIKE LOWER(?) ESCAPE '\'
 			  )
-		)`, i, ftsPart, blobSQL)
-		args = append(args, like, like, like, like, like)
+		)`, i, ftsPart, blobSQL, SystemPrefixSQL("m.content", "m.role"))
+		args = append(args, like, like, like, like, like, like, like)
 	}
 
 	b.WriteString(",\nmatched AS (\n")
@@ -457,16 +461,50 @@ func (db *DB) Search(
 			WHERE 0
 		)`)
 	}
+
+	hitScoreParts := make([]string, len(terms))
+	for i := range terms {
+		hitScoreParts[i] = "CASE WHEN LOWER(m.content) LIKE LOWER(?) ESCAPE '\\' THEN 1 ELSE 0 END"
+	}
+	hitWhereParts := make([]string, len(terms))
+	for i := range terms {
+		hitWhereParts[i] = "LOWER(m.content) LIKE LOWER(?) ESCAPE '\\'"
+	}
+	fmt.Fprintf(&b, `,
+		content_hit AS (
+			SELECT session_id, ordinal, content, hit_query
+			FROM (
+				SELECT m.session_id, m.ordinal, m.content,
+					? AS hit_query,
+					(%s) AS term_hits,
+					ROW_NUMBER() OVER (
+						PARTITION BY m.session_id
+						ORDER BY (%s) DESC, m.ordinal ASC
+					) AS rn
+				FROM messages m
+				JOIN matched mt ON mt.session_id = m.session_id
+				WHERE m.is_system = 0
+				  AND %s
+				  AND (%s)
+			)
+			WHERE rn = 1
+		)`,
+		strings.Join(hitScoreParts, " + "),
+		strings.Join(hitScoreParts, " + "),
+		SystemPrefixSQL("m.content", "m.role"),
+		strings.Join(hitWhereParts, " OR "),
+	)
+
 	fmt.Fprintf(&b, `
 		SELECT s.id, s.project, s.agent,
 			COALESCE(s.display_name, s.session_name, s.first_message, '') AS name,
 			COALESCE(s.ended_at, s.started_at, '') AS session_ended_at,
-			COALESCE(best.best_ordinal, -1) AS ordinal,
+			COALESCE(best.best_ordinal, hit.ordinal, -1) AS ordinal,
 			CASE
-				WHEN m.content IS NOT NULL THEN CASE
-					WHEN instr(LOWER(m.content), LOWER(best.best_query)) > 100
-						THEN '...' || substr(m.content, max(1, instr(LOWER(m.content), LOWER(best.best_query)) - 50), 200) || '...'
-					ELSE substr(m.content, 1, 200) || CASE WHEN length(m.content) > 200 THEN '...' ELSE '' END
+				WHEN COALESCE(m.content, hit.content) IS NOT NULL THEN CASE
+					WHEN instr(LOWER(COALESCE(m.content, hit.content)), LOWER(COALESCE(best.best_query, hit.hit_query))) > 100
+						THEN '...' || substr(COALESCE(m.content, hit.content), max(1, instr(LOWER(COALESCE(m.content, hit.content)), LOWER(COALESCE(best.best_query, hit.hit_query))) - 50), 200) || '...'
+					ELSE substr(COALESCE(m.content, hit.content), 1, 200) || CASE WHEN length(COALESCE(m.content, hit.content)) > 200 THEN '...' ELSE '' END
 				END
 				WHEN LOWER(COALESCE(s.display_name, s.session_name, '')) LIKE LOWER(?) ESCAPE '\'
 					THEN COALESCE(s.display_name, s.session_name, '')
@@ -503,6 +541,7 @@ func (db *DB) Search(
 		FROM matched mt
 		JOIN sessions s ON s.id = mt.session_id
 		LEFT JOIN fts_best best ON best.session_id = s.id
+		LEFT JOIN content_hit hit ON hit.session_id = s.id
 		LEFT JOIN messages m ON m.id = best.best_rowid
 		WHERE s.deleted_at IS NULL
 		  AND EXISTS (
@@ -522,6 +561,13 @@ func (db *DB) Search(
 		args = append(args, firstTerm, ftsExpr)
 		if f.Project != "" {
 			args = append(args, f.Project)
+		}
+	}
+
+	args = append(args, firstTerm)
+	for range 3 {
+		for _, t := range terms {
+			args = append(args, SearchLikePattern(t.Value))
 		}
 	}
 
@@ -569,9 +615,7 @@ func (db *DB) Search(
 			return SearchPage{},
 				fmt.Errorf("scanning result: %w", err)
 		}
-		if r.Ordinal >= 0 {
-			r.Snippet = highlightSearchSnippet(r.Snippet, firstTerm)
-		}
+		r.Snippet = highlightSearchSnippet(r.Snippet, terms)
 		results = append(results, r)
 	}
 	if err := rows.Err(); err != nil {
@@ -586,19 +630,71 @@ func (db *DB) Search(
 	return page, nil
 }
 
-func highlightSearchSnippet(snippet, term string) string {
-	if snippet == "" || term == "" {
+func highlightSearchSnippet(snippet string, terms []SearchTerm) string {
+	if snippet == "" || len(terms) == 0 {
 		return snippet
 	}
-	idx := strings.Index(strings.ToLower(snippet), strings.ToLower(term))
-	if idx < 0 {
+	type span struct{ start, end int }
+	lower := strings.ToLower(snippet)
+	needles := make([]string, 0, len(terms)+1)
+	for _, t := range terms {
+		if t.Value != "" {
+			needles = append(needles, t.Value)
+		}
+	}
+	if joined := JoinedQuery(terms); joined != "" {
+		needles = append(needles, joined)
+	}
+	var spans []span
+	for _, needle := range needles {
+		n := strings.ToLower(needle)
+		from := 0
+		for {
+			i := strings.Index(lower[from:], n)
+			if i < 0 {
+				break
+			}
+			i += from
+			spans = append(spans, span{i, i + len(needle)})
+			from = i + len(n)
+		}
+	}
+	if len(spans) == 0 {
 		return snippet
 	}
-	end := idx + len(term)
-	if end > len(snippet) {
-		return snippet
+	sort.Slice(spans, func(i, j int) bool {
+		if spans[i].start == spans[j].start {
+			return spans[i].end > spans[j].end
+		}
+		return spans[i].start < spans[j].start
+	})
+	merged := make([]span, 0, len(spans))
+	for _, s := range spans {
+		if n := len(merged); n > 0 && s.start <= merged[n-1].end {
+			if s.end > merged[n-1].end {
+				merged[n-1].end = s.end
+			}
+			continue
+		}
+		merged = append(merged, s)
 	}
-	return snippet[:idx] + "<mark>" + snippet[idx:end] + "</mark>" + snippet[end:]
+	var b strings.Builder
+	prev := 0
+	for _, s := range merged {
+		if s.start < prev {
+			continue
+		}
+		if s.end > len(snippet) {
+			s.end = len(snippet)
+		}
+		b.WriteString(snippet[prev:s.start])
+		b.WriteString("<mark>")
+		b.WriteString(snippet[s.start:s.end])
+		b.WriteString("</mark>")
+		prev = s.end
+	}
+	b.WriteString(snippet[prev:])
+	return b.String()
 }
 
 func sqliteAllTermsPrimarySQL(n int, primarySQL string) string {

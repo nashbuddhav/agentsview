@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -136,6 +137,61 @@ func TestVersatileSearch(t *testing.T) {
 		miss, err := d.Search(context.Background(), SearchFilter{Query: `"denied permission"`, Limit: 20})
 		require.NoError(t, err)
 		assert.False(t, contains(miss, "content-hit"), ids(miss))
+	})
+
+	t.Run("unquoted words in different messages of one session", func(t *testing.T) {
+		insertSession(t, d, "split-words", "proj-search", func(s *Session) {
+			s.Agent = "claude"
+			s.StartedAt = new("2024-02-06T10:00:00Z")
+			s.EndedAt = new("2024-02-06T11:00:00Z")
+		})
+		insertMessages(t, d,
+			userMsg("split-words", 0, "please confirm the rollout plan"),
+			asstMsg("split-words", 1, "the previous behaviour stays unchanged"),
+		)
+		insertSession(t, d, "only-confirm", "proj-search", func(s *Session) {
+			s.Agent = "claude"
+			s.StartedAt = new("2024-02-07T10:00:00Z")
+			s.EndedAt = new("2024-02-07T11:00:00Z")
+		})
+		insertMessages(t, d, userMsg("only-confirm", 0, "please confirm the rollout plan"))
+
+		unquoted, err := d.Search(context.Background(), SearchFilter{
+			Query: "confirm behaviour", Limit: 50,
+		})
+		require.NoError(t, err)
+		assert.True(t, contains(unquoted, "split-words"), ids(unquoted))
+		assert.False(t, contains(unquoted, "only-confirm"), ids(unquoted))
+
+		quoted, err := d.Search(context.Background(), SearchFilter{
+			Query: `"confirm behaviour"`, Limit: 50,
+		})
+		require.NoError(t, err)
+		assert.False(t, contains(quoted, "split-words"),
+			"quoted phrase must not match words in different places: %v", ids(quoted))
+	})
+
+	t.Run("quoted contiguous phrase in one message", func(t *testing.T) {
+		insertSession(t, d, "phrase-hit", "proj-search", func(s *Session) {
+			s.Agent = "claude"
+			s.StartedAt = new("2024-02-08T10:00:00Z")
+			s.EndedAt = new("2024-02-08T11:00:00Z")
+		})
+		insertMessages(t, d, userMsg("phrase-hit", 0,
+			"we should confirm behaviour before shipping"))
+
+		page, err := d.Search(context.Background(), SearchFilter{
+			Query: `"confirm behaviour"`, Limit: 50,
+		})
+		require.NoError(t, err)
+		require.True(t, contains(page, "phrase-hit"), ids(page))
+		for _, r := range page.Results {
+			if r.SessionID == "phrase-hit" {
+				assert.Contains(t, strings.ToLower(r.Snippet), "confirm")
+				assert.Contains(t, strings.ToLower(r.Snippet), "behaviour")
+				assert.Contains(t, r.Snippet, "<mark>")
+			}
+		}
 	})
 
 	t.Run("leading trailing repeated whitespace", func(t *testing.T) {

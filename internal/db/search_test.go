@@ -427,8 +427,9 @@ func TestSearch(t *testing.T) {
 		r := page.Results[0]
 		assert.Equal(t, "s7", r.SessionID, "session")
 		assert.Equal(t, -1, r.Ordinal, "ordinal (name-only match)")
-		// Snippet must be the first_message (the matching field), not display_name
-		assert.Equal(t, "firstmsgonlyterm present here", r.Snippet,
+		// Snippet must be the first_message (the matching field), not display_name.
+		// Matching terms are wrapped in <mark> for the command palette.
+		assert.Equal(t, "<mark>firstmsgonlyterm</mark> present here", r.Snippet,
 			"snippet should be first_message")
 	})
 

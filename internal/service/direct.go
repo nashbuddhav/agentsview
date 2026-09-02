@@ -670,7 +670,7 @@ func (b *directBackend) Search(
 		limit = db.MaxSearchLimit
 	}
 	page, err := b.db.Search(ctx, db.SearchFilter{
-		Query:   db.PrepareFTSQuery(query),
+		Query:   query,
 		Project: req.Project,
 		Sort:    req.Sort,
 		Cursor:  req.Cursor,

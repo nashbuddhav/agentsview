@@ -125,7 +125,10 @@ func FTSMatchExpression(terms []SearchTerm) string {
 			b.WriteByte(' ')
 		}
 		b.WriteString(QuoteFTS(t.Value))
-		if ftsPrefixable(t.Value) {
+		// Quoted phrases stay exact. Unquoted alphanumeric tokens get a
+		// prefix star so "clau" matches "claude" without turning
+		// "confirm behaviour" into a required adjacent phrase.
+		if !t.Phrase && ftsPrefixable(t.Value) {
 			b.WriteByte('*')
 		}
 	}
